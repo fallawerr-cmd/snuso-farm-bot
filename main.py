@@ -433,6 +433,7 @@ def run_flask():
 
 async def main():
     init_db()
+    log.info("BASE_DIR=%s files=%s", BASE_DIR, os.listdir(BASE_DIR))
     threading.Thread(target=run_flask, daemon=True).start()
     asyncio.create_task(grow_snus_loop())
     asyncio.create_task(keep_alive_loop())
