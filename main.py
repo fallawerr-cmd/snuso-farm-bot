@@ -11,8 +11,8 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (BufferedInputFile, InlineKeyboardButton,
-                           InlineKeyboardMarkup, InputMediaPhoto)
+from aiogram.types import (BufferedInputFile, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto)
+
 from flask import Flask
 from psycopg2 import pool
 
