@@ -1,268 +1,401 @@
 import asyncio
 import logging
+import os
 import random
 import threading
+import time
+from contextlib import contextmanager
+
 import aiohttp
-import psycopg2
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (FSInputFile, InlineKeyboardButton,
+                           InlineKeyboardMarkup, InputMediaPhoto)
 from flask import Flask
+from psycopg2 import pool
 
-TOKEN = "8699329453:AAG8nOspHv22LBk7eYEgK1Nkz0UWtvtXAFA"
-RENDER_URL = "https://snuso-farm-bot.onrender.com"
-DATABASE_URL = "postgresql://postgres:Qwertyuioplkjhgfdsa1!25June2015@db.royemycrlbvsuwcdmiio.supabase.co:5432/postgres"
+# ---------------------------------------------------------------- конфиг
+# Значения оставлены как были; на Render можно переопределить через env.
+TOKEN = os.getenv("TOKEN", "8699329453:AAG8nOspHv22LBk7eYEgK1Nkz0UWtvtXAFA")
+RENDER_URL = os.getenv("RENDER_URL", "https://snuso-farm-bot.onrender.com")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:Qwertyuioplkjhgfdsa1!25June2015@db.royemycrlbvsuwcdmiio.supabase.co:5432/postgres",
+)
 
-# Прямые ссылки на твои картинки из репозитория GitHub
-IMG_SHOP = "https://raw.githubusercontent.com/fallawerr-cmd/snuso-farm-bot/main/shop.jpg"
-IMG_CUST = "https://raw.githubusercontent.com/fallawerr-cmd/snuso-farm-bot/main/cust.jpg"
-IMG_SELL = "https://raw.githubusercontent.com/fallawerr-cmd/snuso-farm-bot/main/sell.jpg"
+BUSH_PRICE = 100
+SNUS_PRICE = 50
+SNUS_PER_BUSH = 4
+ROTTEN_CHANCE = 0.25
+GROW_INTERVAL = 15 * 60  # секунд
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IMAGES = {
+    "shop": os.path.join(BASE_DIR, "shop.jpg"),
+    "cust": os.path.join(BASE_DIR, "cust.jpg"),
+    "sell": os.path.join(BASE_DIR, "sell.jpg"),
+}
 
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("snus")
+
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-conn = psycopg2.connect(DATABASE_URL)
-cursor = conn.cursor()
+# ---------------------------------------------------------------- БД
+db_pool = pool.ThreadedConnectionPool(1, 5, DATABASE_URL)
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id BIGINT PRIMARY KEY,
-    balance INT DEFAULT 100,
-    bushes INT DEFAULT 0,
-    normal_snus INT DEFAULT 0,
-    rotten_snus INT DEFAULT 0
+
+@contextmanager
+def db():
+    conn = db_pool.getconn()
+    try:
+        with conn:  # commit / rollback
+            with conn.cursor() as cur:
+                yield cur
+    finally:
+        db_pool.putconn(conn)
+
+
+def init_db():
+    with db() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                balance INT DEFAULT 100,
+                bushes INT DEFAULT 0,
+                normal_snus INT DEFAULT 0,
+                rotten_snus INT DEFAULT 0
+            )
+            """
+        )
+
+
+def _get_user(user_id: int) -> dict:
+    with db() as cur:
+        cur.execute(
+            "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,)
+        )
+        cur.execute(
+            "SELECT balance, bushes, normal_snus, rotten_snus FROM users WHERE user_id = %s",
+            (user_id,),
+        )
+        b, bu, n, r = cur.fetchone()
+    return {"balance": b, "bushes": bu, "normal": n, "rotten": r}
+
+
+def _buy_bushes(user_id: int, amount: int) -> bool:
+    """Атомарная покупка: баланс не уйдёт в минус даже при быстрых кликах."""
+    cost = amount * BUSH_PRICE
+    with db() as cur:
+        cur.execute(
+            """
+            UPDATE users SET balance = balance - %s, bushes = bushes + %s
+            WHERE user_id = %s AND balance >= %s
+            """,
+            (cost, amount, user_id, cost),
+        )
+        return cur.rowcount == 1
+
+
+def _sell_normal(user_id: int):
+    """Возвращает (сколько продано, новый баланс) или None."""
+    with db() as cur:
+        cur.execute(
+            """
+            WITH old AS (
+                SELECT normal_snus FROM users WHERE user_id = %s FOR UPDATE
+            )
+            UPDATE users
+            SET balance = balance + old.normal_snus * %s, normal_snus = 0
+            FROM old
+            WHERE users.user_id = %s AND old.normal_snus > 0
+            RETURNING old.normal_snus, users.balance
+            """,
+            (user_id, SNUS_PRICE, user_id),
+        )
+        return cur.fetchone()
+
+
+def _grow_all():
+    with db() as cur:
+        cur.execute("SELECT user_id, bushes FROM users WHERE bushes > 0")
+        rows = cur.fetchall()
+        for user_id, bushes in rows:
+            total = bushes * SNUS_PER_BUSH
+            rotten = sum(random.random() < ROTTEN_CHANCE for _ in range(total))
+            normal = total - rotten
+            cur.execute(
+                """
+                UPDATE users SET normal_snus = normal_snus + %s,
+                                 rotten_snus = rotten_snus + %s
+                WHERE user_id = %s
+                """,
+                (normal, rotten, user_id),
+            )
+    return len(rows)
+
+
+async def get_user(user_id):
+    return await asyncio.to_thread(_get_user, user_id)
+
+
+# ---------------------------------------------------------------- картинки
+# Картинки берём с диска (они лежат в репо) и кэшируем file_id Telegram,
+# так что после первой отправки они грузятся мгновенно.
+_file_ids: dict[str, str] = {}
+
+
+def _photo(key: str):
+    return _file_ids.get(key) or FSInputFile(IMAGES[key])
+
+
+def _remember(key: str, msg: types.Message | None):
+    if msg and msg.photo:
+        _file_ids[key] = msg.photo[-1].file_id
+
+
+async def show(target, key: str, text: str, kb: InlineKeyboardMarkup):
+    """Показывает экран с картинкой. target: Message (новое) или CallbackQuery (правка)."""
+    if isinstance(target, types.Message):
+        msg = await target.answer_photo(
+            _photo(key), caption=text, reply_markup=kb, parse_mode="HTML"
+        )
+        _remember(key, msg)
+        return
+
+    cb: types.CallbackQuery = target
+    try:
+        res = await cb.message.edit_media(
+            InputMediaPhoto(media=_photo(key), caption=text, parse_mode="HTML"),
+            reply_markup=kb,
+        )
+        _remember(key, res if isinstance(res, types.Message) else None)
+    except TelegramBadRequest as e:
+        if "not modified" in str(e):
+            return
+        # сообщение старое / без фото — отправляем заново
+        log.warning("edit_media failed: %s", e)
+        try:
+            await cb.message.delete()
+        except TelegramBadRequest:
+            pass
+        msg = await cb.message.answer_photo(
+            _photo(key), caption=text, reply_markup=kb, parse_mode="HTML"
+        )
+        _remember(key, msg)
+
+
+# ---------------------------------------------------------------- клавиатуры
+def kb(rows):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows
+        ]
+    )
+
+
+MAIN_KB = kb(
+    [
+        [("🛍 Магазин", "menu_shop"), ("💵 Продать снюс", "menu_sell")],
+        [("📊 Профиль", "menu_profile")],
+    ]
 )
-""")
-conn.commit()
-
-
-def get_user(user_id: int):
-    cursor.execute("SELECT balance, bushes, normal_snus, rotten_snus FROM users WHERE user_id = %s", (user_id,))
-    user = cursor.fetchone()
-    if not user:
-        cursor.execute("INSERT INTO users (user_id, balance, bushes, normal_snus, rotten_snus) VALUES (%s, 100, 0, 0, 0)", (user_id,))
-        conn.commit()
-        return {"balance": 100, "bushes": 0, "normal_snus": 0, "rotten_snus": 0}
-    return {"balance": user[0], "bushes": user[1], "normal_snus": user[2], "rotten_snus": user[3]}
-
-
-def update_user(user_id: int, balance: int, bushes: int, normal: int, rotten: int):
-    cursor.execute("UPDATE users SET balance = %s, bushes = %s, normal_snus = %s, rotten_snus = %s WHERE user_id = %s", 
-                   (balance, bushes, normal, rotten, user_id))
-    conn.commit()
-
-
-def get_main_menu():
-    keyboard = [
-        [InlineKeyboardButton(text="🛍 Магазин", callback_data="menu_shop"),
-         InlineKeyboardButton(text="💵 Продать снюс", callback_data="menu_sell")],
-        [InlineKeyboardButton(text="📊 Профиль", callback_data="menu_profile")]
+SHOP_KB = kb([[("🌿 Снюсовый куст", "shop_cust")], [("⬅️ Назад", "back_main")]])
+BUY_KB = kb(
+    [
+        [(f"🛒 Купить 1 ({BUSH_PRICE}₽)", "buy_1"), (f"📦 Купить 5 ({BUSH_PRICE * 5}₽)", "buy_5")],
+        [("💎 Купить на все деньги", "buy_all")],
+        [("⬅️ В магазин", "menu_shop")],
     ]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+)
+SELL_KB = kb([[("💸 Продать весь нормальный снюс", "action_sell")], [("⬅️ Назад", "back_main")]])
+PROFILE_KB = kb([[("⬅️ Назад", "back_main")]])
 
 
-def get_shop_menu():
-    keyboard = [
-        [InlineKeyboardButton(text="🌿 Снюсовый куст 🌱", callback_data="shop_cust")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+# ---------------------------------------------------------------- тексты
+next_grow_at = time.time() + GROW_INTERVAL
 
 
-def get_buy_menu():
-    keyboard = [
-        [InlineKeyboardButton(text="🛒 Купить 1 (100₽)", callback_data="buy_1"),
-         InlineKeyboardButton(text="📦 Купить 5 (500₽)", callback_data="buy_5")],
-        [InlineKeyboardButton(text="💎 Купить на все", callback_data="buy_all")],
-        [InlineKeyboardButton(text="⬅️ Назад в магазин", callback_data="menu_shop")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+def grow_timer() -> str:
+    left = max(0, int(next_grow_at - time.time()))
+    return f"{left // 60}:{left % 60:02d}"
 
 
-def get_sell_menu():
-    keyboard = [
-        [InlineKeyboardButton(text="💸 Продать весь нормальный снюс", callback_data="action_sell")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+def main_text(u):
+    return (
+        "🌲 <b>Снюсовая Ферма</b>\n\n"
+        f"💰 Баланс: <b>{u['balance']} ₽</b>\n"
+        f"🌿 Кустов: <b>{u['bushes']}</b>\n"
+        f"📦 Нормальный снюс: <b>{u['normal']}</b>\n"
+        f"🤢 Гнилой снюс: <b>{u['rotten']}</b>\n\n"
+        f"⏳ Следующий урожай через <b>{grow_timer()}</b>\n"
+        "Выбирай раздел:"
+    )
 
 
+# ---------------------------------------------------------------- хендлеры
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    user = get_user(message.from_user.id)
-    text = (
-        "🌲 **Добро пожаловать на Снюсовую Ферму!**\n\n"
-        f"💰 Баланс: `{user['balance']} руб.`\n"
-        f"🌿 Кустов на ферме: `{user['bushes']}`\n"
-        f"📦 Нормальный снюс: `{user['normal_snus']} шт.`\n"
-        f"🤢 Гнилой снюс: `{user['rotten_snus']} шт.`\n\n"
-        "Выбирай раздел ниже:"
-    )
-    try:
-        await message.answer_photo(photo=IMG_SHOP, caption=text, reply_markup=get_main_menu(), parse_mode="Markdown")
-    except:
-        await message.answer(text=text, reply_markup=get_main_menu(), parse_mode="Markdown")
+    u = await get_user(message.from_user.id)
+    await show(message, "shop", main_text(u), MAIN_KB)
 
 
 @dp.callback_query(F.data == "back_main")
-async def callback_back_main(callback: types.CallbackQuery):
-    user = get_user(callback.from_user.id)
-    text = (
-        "🌲 **Главное меню Снюсовой Фермы:**\n\n"
-        f"💰 Баланс: `{user['balance']} руб.`\n"
-        f"🌿 Кустов: `{user['bushes']}`"
-    )
-    try:
-        await callback.message.edit_media(
-            media=types.InputMediaPhoto(media=IMG_SHOP, caption=text, parse_mode="Markdown"),
-            reply_markup=get_main_menu()
-        )
-    except:
-        await callback.message.edit_text(text=text, reply_markup=get_main_menu(), parse_mode="Markdown")
-    await callback.answer()
+async def cb_back(cb: types.CallbackQuery):
+    u = await get_user(cb.from_user.id)
+    await show(cb, "shop", main_text(u), MAIN_KB)
+    await cb.answer()
 
 
 @dp.callback_query(F.data == "menu_shop")
-async def callback_shop(callback: types.CallbackQuery):
-    text = "🛍 **Магазин фермы**\n\nВыбери товар для покупки:"
-    try:
-        await callback.message.edit_media(
-            media=types.InputMediaPhoto(media=IMG_CUST, caption=text, parse_mode="Markdown"),
-            reply_markup=get_shop_menu()
-        )
-    except:
-        await callback.message.edit_text(text=text, reply_markup=get_shop_menu(), parse_mode="Markdown")
-    await callback.answer()
+async def cb_shop(cb: types.CallbackQuery):
+    u = await get_user(cb.from_user.id)
+    text = f"🛍 <b>Магазин фермы</b>\n\n💰 Баланс: <b>{u['balance']} ₽</b>\nВыбери товар:"
+    await show(cb, "cust", text, SHOP_KB)
+    await cb.answer()
+
+
+async def cust_text(u, note=""):
+    return (
+        f"🌿 <b>Снюсовый куст</b>\n\n"
+        f"• Цена: <b>{BUSH_PRICE} ₽</b>\n"
+        f"• Даёт до {SNUS_PER_BUSH} снюса каждые {GROW_INTERVAL // 60} минут\n"
+        f"• Шанс гнилого пакетика: {int(ROTTEN_CHANCE * 100)}%\n\n"
+        f"💰 Баланс: <b>{u['balance']} ₽</b>\n"
+        f"🌱 Твоих кустов: <b>{u['bushes']}</b>"
+        + (f"\n\n{note}" if note else "")
+    )
 
 
 @dp.callback_query(F.data == "shop_cust")
-async def callback_shop_cust(callback: types.CallbackQuery):
-    text = (
-        "🌿 **Снюсовый куст**\n\n"
-        "• Стоимость: `100 руб.`\n"
-        "• Производит до 4 снюсов (каждые 15 минут)\n"
-        "• Шанс 25% на гнилой пакетик"
-    )
-    try:
-        await callback.message.edit_media(
-            media=types.InputMediaPhoto(media=IMG_CUST, caption=text, parse_mode="Markdown"),
-            reply_markup=get_buy_menu()
-        )
-    except:
-        await callback.message.edit_text(text=text, reply_markup=get_buy_menu(), parse_mode="Markdown")
-    await callback.answer()
+async def cb_shop_cust(cb: types.CallbackQuery):
+    u = await get_user(cb.from_user.id)
+    await show(cb, "cust", await cust_text(u), BUY_KB)
+    await cb.answer()
 
 
 @dp.callback_query(F.data.startswith("buy_"))
-async def callback_buy(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    user = get_user(user_id)
-    action = callback.data
-
-    price_per_one = 100
-    amount = 0
+async def cb_buy(cb: types.CallbackQuery):
+    user_id = cb.from_user.id
+    u = await get_user(user_id)
+    action = cb.data
 
     if action == "buy_1":
         amount = 1
     elif action == "buy_5":
         amount = 5
-    elif action == "buy_all":
-        amount = user["balance"] // price_per_one
+    else:
+        amount = u["balance"] // BUSH_PRICE
 
-    total_cost = amount * price_per_one
-
-    if amount <= 0:
-        await callback.answer("❌ Недостаточно средств для покупки!", show_alert=True)
+    if amount <= 0 or u["balance"] < amount * BUSH_PRICE:
+        await cb.answer("❌ Не хватает денег!", show_alert=True)
         return
 
-    if user["balance"] >= total_cost:
-        user["balance"] -= total_cost
-        user["bushes"] += amount
-        update_user(user_id, user["balance"], user["bushes"], user["normal_snus"], user["rotten_snus"])
-        await callback.answer(f"✅ Успешно куплено кустов: {amount} шт. за {total_cost}₽!", show_alert=True)
-        
-        text = f"🌿 **Снюсовый куст**\n\nКуплено! Твой баланс: `{user['balance']} руб.`\nКустов на ферме: `{user['bushes']}`"
-        try:
-            await callback.message.edit_media(
-                media=types.InputMediaPhoto(media=IMG_CUST, caption=text, parse_mode="Markdown"),
-                reply_markup=get_buy_menu()
-            )
-        except:
-            await callback.message.edit_text(text=text, reply_markup=get_buy_menu(), parse_mode="Markdown")
-    else:
-        await callback.answer("❌ Не хватает денег!", show_alert=True)
+    ok = await asyncio.to_thread(_buy_bushes, user_id, amount)
+    if not ok:
+        await cb.answer("❌ Не хватает денег!", show_alert=True)
+        return
+
+    u = await get_user(user_id)
+    note = f"✅ Куплено кустов: <b>{amount}</b> за <b>{amount * BUSH_PRICE} ₽</b>"
+    await show(cb, "cust", await cust_text(u, note), BUY_KB)
+    await cb.answer("✅ Куплено!")
 
 
 @dp.callback_query(F.data == "menu_sell")
-async def callback_sell_menu(callback: types.CallbackQuery):
-    user = get_user(callback.from_user.id)
+async def cb_sell_menu(cb: types.CallbackQuery):
+    u = await get_user(cb.from_user.id)
     text = (
-        "💵 **Рынок сбыта**\n\n"
-        f"📦 У тебя в инвентаре нормального снюса: `{user['normal_snus']} шт.`\n"
-        f"💰 Цена продажи: `50 руб. / шт.`"
+        "💵 <b>Рынок сбыта</b>\n\n"
+        f"📦 Нормального снюса: <b>{u['normal']}</b>\n"
+        f"💰 Цена: <b>{SNUS_PRICE} ₽ / шт.</b>\n"
+        f"💵 Можно выручить: <b>{u['normal'] * SNUS_PRICE} ₽</b>"
     )
-    try:
-        await callback.message.edit_media(
-            media=types.InputMediaPhoto(media=IMG_SELL, caption=text, parse_mode="Markdown"),
-            reply_markup=get_sell_menu()
-        )
-    except:
-        await callback.message.edit_text(text=text, reply_markup=get_sell_menu(), parse_mode="Markdown")
-    await callback.answer()
+    await show(cb, "sell", text, SELL_KB)
+    await cb.answer()
 
 
 @dp.callback_query(F.data == "action_sell")
-async def callback_action_sell(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    user = get_user(user_id)
-    normal_count = user["normal_snus"]
-
-    if normal_count > 0:
-        earned = normal_count * 50
-        user["balance"] += earned
-        user["normal_snus"] = 0
-        update_user(user_id, user["balance"], user["bushes"], user["normal_snus"], user["rotten_snus"])
-        
-        text = f"💵 Ты успешно продал `{normal_count} шт.` снюса и поднял `{earned} руб.`!\nБаланс: `{user['balance']} руб.`"
-        await callback.answer(f"Продано на {earned}₽!", show_alert=True)
-        
-        try:
-            await callback.message.edit_media(
-                media=types.InputMediaPhoto(media=IMG_SELL, caption=text, parse_mode="Markdown"),
-                reply_markup=get_sell_menu()
-            )
-        except:
-            await callback.message.edit_text(text=text, reply_markup=get_sell_menu(), parse_mode="Markdown")
-    else:
-        await callback.answer("❌ У тебя нет нормального снюса для продажи!", show_alert=True)
+async def cb_sell(cb: types.CallbackQuery):
+    res = await asyncio.to_thread(_sell_normal, cb.from_user.id)
+    if not res:
+        await cb.answer("❌ Нет нормального снюса для продажи!", show_alert=True)
+        return
+    count, balance = res
+    text = (
+        "💵 <b>Рынок сбыта</b>\n\n"
+        f"✅ Продано: <b>{count} шт.</b> на <b>{count * SNUS_PRICE} ₽</b>\n"
+        f"💰 Баланс: <b>{balance} ₽</b>"
+    )
+    await show(cb, "sell", text, SELL_KB)
+    await cb.answer(f"Продано на {count * SNUS_PRICE}₽!")
 
 
 @dp.callback_query(F.data == "menu_profile")
-async def callback_profile(callback: types.CallbackQuery):
-    user = get_user(callback.from_user.id)
+async def cb_profile(cb: types.CallbackQuery):
+    u = await get_user(cb.from_user.id)
     text = (
-        f"📊 **Твой профиль:**\n\n"
-        f"💰 Деньги: `{user['balance']} руб.`\n"
-        f"🌱 Кустов: `{user['bushes']}`\n"
-        f"📦 Нормальный снюс: `{user['normal_snus']} шт.`\n"
-        f"🤢 Гнилой снюс: `{user['rotten_snus']} шт.`"
+        "📊 <b>Твой профиль</b>\n\n"
+        f"💰 Деньги: <b>{u['balance']} ₽</b>\n"
+        f"🌱 Кустов: <b>{u['bushes']}</b>\n"
+        f"📦 Нормальный снюс: <b>{u['normal']}</b>\n"
+        f"🤢 Гнилой снюс: <b>{u['rotten']}</b>\n\n"
+        f"⏳ Следующий урожай через <b>{grow_timer()}</b>"
     )
-    await callback.answer(text, show_alert=True)
+    await show(cb, "shop", text, PROFILE_KB)
+    await cb.answer()
 
 
+# ---------------------------------------------------------------- фон
 async def grow_snus_loop():
+    global next_grow_at
     while True:
-        await asyncio.sleep(900)
-        cursor.execute("SELECT user_id, bushes, normal_snus, rotten_snus FROM users WHERE bushes > 0")
-        all_users = cursor.fetchall()
+        next_grow_at = time.time() + GROW_INTERVAL
+        await asyncio.sleep(GROW_INTERVAL)
+        try:
+            n = await asyncio.to_thread(_grow_all)
+            log.info("Урожай выдан %s игрокам", n)
+        except Exception:
+            log.exception("Ошибка в цикле роста")
 
-        for row in all_users:
-            user_id, bushes, normal, rotten = row
-            for _ in range(bushes * 4):
-                is_rotten = random.randint(1, 4) == 1
-                if is_rotten:
-                    rotten += 1
-                else:
-                    normal
+
+async def keep_alive_loop():
+    """Пингуем сам себя, чтобы Render не усыплял сервис."""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(RENDER_URL, timeout=aiohttp.ClientTimeout(total=15)):
+                    pass
+        except Exception as e:
+            log.warning("keep-alive не удался: %s", e)
+        await asyncio.sleep(600)
+
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def index():
+    return "Snus farm is running"
+
+
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+
+
+async def main():
+    init_db()
+    threading.Thread(target=run_flask, daemon=True).start()
+    asyncio.create_task(grow_snus_loop())
+    asyncio.create_task(keep_alive_loop())
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
