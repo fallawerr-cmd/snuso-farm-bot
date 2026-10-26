@@ -144,8 +144,8 @@ async def get_user(user_id):
 
 
 # ---------------------------------------------------------------- картинки
-# Порядок: file_id (кэш Telegram) -> ссылка на GitHub -> скачиваем сами и заливаем.
-# Если всё упало - отправляем текст, но в лог пишем причину.
+# Порядок: file_id -> файл рядом с ботом -> ссылка GitHub -> скачать и залить.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _file_ids: dict[str, str] = {}
 _bytes_cache: dict[str, BufferedInputFile] = {}
 
@@ -153,7 +153,9 @@ _bytes_cache: dict[str, BufferedInputFile] = {}
 async def _download(key: str) -> BufferedInputFile:
     if key not in _bytes_cache:
         async with aiohttp.ClientSession() as session:
-            async with session.get(IMAGES[key], timeout=aiohttp.ClientTimeout(total=20)) as r:
+            async with session.get(
+                IMAGES[key], timeout=aiohttp.ClientTimeout(total=20)
+            ) as r:
                 r.raise_for_status()
                 data = await r.read()
         _bytes_cache[key] = BufferedInputFile(data, filename=f"{key}.jpg")
@@ -161,11 +163,16 @@ async def _download(key: str) -> BufferedInputFile:
 
 
 async def _candidates(key: str):
-    """Генератор вариантов источника картинки по порядку."""
     if key in _file_ids:
         yield _file_ids[key]
+    path = os.path.join(BASE_DIR, f"{key}.jpg")
+    if os.path.exists(path):
+        yield FSInputFile(path)
     yield IMAGES[key]
-    yield await _download(key)
+    try:
+        yield await _download(key)
+    except Exception as e:
+        log.warning("не скачалась картинка %s: %s", key, e)
 
 
 def _remember(key: str, msg):
@@ -173,61 +180,59 @@ def _remember(key: str, msg):
         _file_ids[key] = msg.photo[-1].file_id
 
 
+def _forget(key: str, photo):
+    if isinstance(photo, str) and _file_ids.get(key) == photo:
+        _file_ids.pop(key, None)  # протухший file_id
+
+
 async def show(target, key: str, text: str, kb: InlineKeyboardMarkup):
-    """Экран с картинкой. target: Message (новое сообщение) или CallbackQuery (правка)."""
+    """Экран с картинкой. target: Message или CallbackQuery."""
     is_cb = isinstance(target, types.CallbackQuery)
     message = target.message if is_cb else target
     last_err = None
 
-    # 1) пробуем отредактировать текущее сообщение (для кнопок)
+    # 1) правим текущее сообщение (картинка остаётся прикреплённой)
     if is_cb:
-        try:
-            async for photo in _candidates(key):
-                try:
-                    res = await message.edit_media(
-                        InputMediaPhoto(media=photo, caption=text, parse_mode="HTML"),
-                        reply_markup=kb,
-                    )
-                    _remember(key, res)
+        async for photo in _candidates(key):
+            try:
+                res = await message.edit_media(
+                    InputMediaPhoto(media=photo, caption=text, parse_mode="HTML"),
+                    reply_markup=kb,
+                )
+                _remember(key, res)
+                return
+            except TelegramBadRequest as e:
+                if "not modified" in str(e):
                     return
-                except TelegramBadRequest as e:
-                    if "not modified" in str(e):
-                        return
-                    last_err = e
-                    log.warning("edit_media (%s) не вышел: %s", key, e)
-                    if "there is no media" in str(e) or "message to edit" in str(e):
-                        break
-        except Exception as e:
-            last_err = e
-            log.warning("картинка %s: %s", key, e)
-
+                last_err = e
+                _forget(key, photo)
+                log.warning("edit_media (%s) не вышел: %s", key, e)
+                if "no media" in str(e) or "message to edit" in str(e):
+                    break
+            except Exception as e:
+                last_err = e
+                log.warning("edit_media (%s): %s", key, e)
         try:
             await message.delete()
         except Exception:
             pass
 
-    # 2) отправляем новое сообщение с картинкой
-    try:
-        async for photo in _candidates(key):
-            try:
-                msg = await message.answer_photo(
-                    photo, caption=text, reply_markup=kb, parse_mode="HTML"
-                )
-                _remember(key, msg)
-                return
-            except TelegramBadRequest as e:
-                last_err = e
-                log.warning("answer_photo (%s) не вышел: %s", key, e)
-    except Exception as e:
-        last_err = e
-        log.warning("картинка %s: %s", key, e)
+    # 2) новое сообщение с картинкой
+    async for photo in _candidates(key):
+        try:
+            msg = await message.answer_photo(
+                photo, caption=text, reply_markup=kb, parse_mode="HTML"
+            )
+            _remember(key, msg)
+            return
+        except Exception as e:
+            last_err = e
+            _forget(key, photo)
+            log.warning("answer_photo (%s) не вышел: %s", key, e)
 
     # 3) крайний случай - текст
     log.error("Картинка %s не отправилась, шлю текст. Причина: %s", key, last_err)
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
-
-
-# ---------------------------------------------------------------- клавиатуры
 def kb(rows):
     return InlineKeyboardMarkup(
         inline_keyboard=[
