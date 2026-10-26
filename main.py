@@ -10,23 +10,17 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile
 from flask import Flask
 
-# 🔑 Твой токен от BotFather
 TOKEN = "8699329453:AAG8nOspHv22LBk7eYEgK1Nkz0UWtvtXAFA"
-# 🌐 Твой URL на Render для самопинга
 RENDER_URL = "https://snuso-farm-bot.onrender.com"
-
-# ☁️ Твоя облачная база Supabase
 DATABASE_URL = "postgresql://postgres:Qwertyuioplkjhgfdsa1!25June2015@db.royemycrlbvsuwcdmiio.supabase.co:5432/postgres"
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ==================== БАЗА ДАННЫХ (PostgreSQL / Supabase) ====================
 conn = psycopg2.connect(DATABASE_URL)
 cursor = conn.cursor()
 
-# Создаем таблицу игроков в облаке, если её еще нет
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id BIGINT PRIMARY KEY,
@@ -54,8 +48,6 @@ def update_user(user_id: int, balance: int, bushes: int, normal: int, rotten: in
                    (balance, bushes, normal, rotten, user_id))
     conn.commit()
 
-
-# ==================== КЛАВИАТУРЫ ====================
 
 def get_main_menu():
     keyboard = [
@@ -92,8 +84,6 @@ def get_sell_menu():
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-# ==================== ОБРАБОТЧИКИ КОМАНД И КНОПОК ====================
-
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     user = get_user(message.from_user.id)
@@ -106,7 +96,7 @@ async def cmd_start(message: types.Message):
         "Выбирай раздел ниже:"
     )
     try:
-        photo = FSInputFile("shop.png")
+        photo = FSInputFile("shop.jpg")
         await message.answer_photo(photo=photo, caption=text, reply_markup=get_main_menu(), parse_mode="Markdown")
     except:
         await message.answer(text=text, reply_markup=get_main_menu(), parse_mode="Markdown")
@@ -121,7 +111,7 @@ async def callback_back_main(callback: types.CallbackQuery):
         f"🌿 Кустов: `{user['bushes']}`"
     )
     try:
-        photo = FSInputFile("shop.png")
+        photo = FSInputFile("shop.jpg")
         await callback.message.edit_media(
             media=types.InputMediaPhoto(media=photo, caption=text, parse_mode="Markdown"),
             reply_markup=get_main_menu()
@@ -135,7 +125,7 @@ async def callback_back_main(callback: types.CallbackQuery):
 async def callback_shop(callback: types.CallbackQuery):
     text = "🛍 **Магазин фермы**\n\nВыбери товар для покупки:"
     try:
-        photo = FSInputFile("cust.png")
+        photo = FSInputFile("cust.jpg")
         await callback.message.edit_media(
             media=types.InputMediaPhoto(media=photo, caption=text, parse_mode="Markdown"),
             reply_markup=get_shop_menu()
@@ -154,7 +144,7 @@ async def callback_shop_cust(callback: types.CallbackQuery):
         "• Шанс 25% на гнилой пакетик"
     )
     try:
-        photo = FSInputFile("cust.png")
+        photo = FSInputFile("cust.jpg")
         await callback.message.edit_media(
             media=types.InputMediaPhoto(media=photo, caption=text, parse_mode="Markdown"),
             reply_markup=get_buy_menu()
@@ -194,7 +184,7 @@ async def callback_buy(callback: types.CallbackQuery):
         
         text = f"🌿 **Снюсовый куст**\n\nКуплено! Твой баланс: `{user['balance']} руб.`\nКустов на ферме: `{user['bushes']}`"
         try:
-            photo = FSInputFile("cust.png")
+            photo = FSInputFile("cust.jpg")
             await callback.message.edit_media(
                 media=types.InputMediaPhoto(media=photo, caption=text, parse_mode="Markdown"),
                 reply_markup=get_buy_menu()
@@ -214,7 +204,7 @@ async def callback_sell_menu(callback: types.CallbackQuery):
         f"💰 Цена продажи: `50 руб. / шт.`"
     )
     try:
-        photo = FSInputFile("sell.png")
+        photo = FSInputFile("sell.jpg")
         await callback.message.edit_media(
             media=types.InputMediaPhoto(media=photo, caption=text, parse_mode="Markdown"),
             reply_markup=get_sell_menu()
@@ -240,7 +230,7 @@ async def callback_action_sell(callback: types.CallbackQuery):
         await callback.answer(f"Продано на {earned}₽!", show_alert=True)
         
         try:
-            photo = FSInputFile("sell.png")
+            photo = FSInputFile("sell.jpg")
             await callback.message.edit_media(
                 media=types.InputMediaPhoto(media=photo, caption=text, parse_mode="Markdown"),
                 reply_markup=get_sell_menu()
@@ -264,7 +254,6 @@ async def callback_profile(callback: types.CallbackQuery):
     await callback.answer(text, show_alert=True)
 
 
-# ==================== ФОНОВЫЙ РОСТ СНЮСА (каждые 15 мин) ====================
 async def grow_snus_loop():
     while True:
         await asyncio.sleep(900)
@@ -284,7 +273,6 @@ async def grow_snus_loop():
         logging.info("Урожай снюса обновился в облаке!")
 
 
-# ==================== САМОПИНГ (Каждые 30 секунд от сна) ====================
 async def self_ping_loop():
     await asyncio.sleep(10)
     async with aiohttp.ClientSession() as session:
@@ -297,7 +285,6 @@ async def self_ping_loop():
             await asyncio.sleep(30)
 
 
-# ==================== FLASK-СЕРВЕР (Для Render.com) ====================
 app = Flask(__name__)
 
 @app.route("/")
@@ -308,7 +295,6 @@ def run_flask():
     app.run(host="0.0.0.0", port=8080)
 
 
-# ==================== ЗАПУСК ====================
 async def main():
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
