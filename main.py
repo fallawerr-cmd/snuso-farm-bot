@@ -11,7 +11,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (FSInputFile, InlineKeyboardButton,
+from aiogram.types import (BufferedInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, InputMediaPhoto)
 from flask import Flask
 from psycopg2 import pool
@@ -31,11 +31,11 @@ SNUS_PER_BUSH = 4
 ROTTEN_CHANCE = 0.25
 GROW_INTERVAL = 15 * 60  # секунд
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RAW = "https://raw.githubusercontent.com/fallawerr-cmd/snuso-farm-bot/main"
 IMAGES = {
-    "shop": os.path.join(BASE_DIR, "shop.jpg"),
-    "cust": os.path.join(BASE_DIR, "cust.jpg"),
-    "sell": os.path.join(BASE_DIR, "sell.jpg"),
+    "shop": f"{RAW}/shop.jpg",
+    "cust": f"{RAW}/cust.jpg",
+    "sell": f"{RAW}/sell.jpg",
 }
 
 logging.basicConfig(level=logging.INFO)
@@ -144,49 +144,87 @@ async def get_user(user_id):
 
 
 # ---------------------------------------------------------------- картинки
-# Картинки берём с диска (они лежат в репо) и кэшируем file_id Telegram,
-# так что после первой отправки они грузятся мгновенно.
+# Порядок: file_id (кэш Telegram) -> ссылка на GitHub -> скачиваем сами и заливаем.
+# Если всё упало - отправляем текст, но в лог пишем причину.
 _file_ids: dict[str, str] = {}
+_bytes_cache: dict[str, BufferedInputFile] = {}
 
 
-def _photo(key: str):
-    return _file_ids.get(key) or FSInputFile(IMAGES[key])
+async def _download(key: str) -> BufferedInputFile:
+    if key not in _bytes_cache:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(IMAGES[key], timeout=aiohttp.ClientTimeout(total=20)) as r:
+                r.raise_for_status()
+                data = await r.read()
+        _bytes_cache[key] = BufferedInputFile(data, filename=f"{key}.jpg")
+    return _bytes_cache[key]
 
 
-def _remember(key: str, msg: types.Message | None):
-    if msg and msg.photo:
+async def _candidates(key: str):
+    """Генератор вариантов источника картинки по порядку."""
+    if key in _file_ids:
+        yield _file_ids[key]
+    yield IMAGES[key]
+    yield await _download(key)
+
+
+def _remember(key: str, msg):
+    if isinstance(msg, types.Message) and msg.photo:
         _file_ids[key] = msg.photo[-1].file_id
 
 
 async def show(target, key: str, text: str, kb: InlineKeyboardMarkup):
-    """Показывает экран с картинкой. target: Message (новое) или CallbackQuery (правка)."""
-    if isinstance(target, types.Message):
-        msg = await target.answer_photo(
-            _photo(key), caption=text, reply_markup=kb, parse_mode="HTML"
-        )
-        _remember(key, msg)
-        return
+    """Экран с картинкой. target: Message (новое сообщение) или CallbackQuery (правка)."""
+    is_cb = isinstance(target, types.CallbackQuery)
+    message = target.message if is_cb else target
+    last_err = None
 
-    cb: types.CallbackQuery = target
-    try:
-        res = await cb.message.edit_media(
-            InputMediaPhoto(media=_photo(key), caption=text, parse_mode="HTML"),
-            reply_markup=kb,
-        )
-        _remember(key, res if isinstance(res, types.Message) else None)
-    except TelegramBadRequest as e:
-        if "not modified" in str(e):
-            return
-        # сообщение старое / без фото — отправляем заново
-        log.warning("edit_media failed: %s", e)
+    # 1) пробуем отредактировать текущее сообщение (для кнопок)
+    if is_cb:
         try:
-            await cb.message.delete()
-        except TelegramBadRequest:
+            async for photo in _candidates(key):
+                try:
+                    res = await message.edit_media(
+                        InputMediaPhoto(media=photo, caption=text, parse_mode="HTML"),
+                        reply_markup=kb,
+                    )
+                    _remember(key, res)
+                    return
+                except TelegramBadRequest as e:
+                    if "not modified" in str(e):
+                        return
+                    last_err = e
+                    log.warning("edit_media (%s) не вышел: %s", key, e)
+                    if "there is no media" in str(e) or "message to edit" in str(e):
+                        break
+        except Exception as e:
+            last_err = e
+            log.warning("картинка %s: %s", key, e)
+
+        try:
+            await message.delete()
+        except Exception:
             pass
-        msg = await cb.message.answer_photo(
-            _photo(key), caption=text, reply_markup=kb, parse_mode="HTML"
-        )
-        _remember(key, msg)
+
+    # 2) отправляем новое сообщение с картинкой
+    try:
+        async for photo in _candidates(key):
+            try:
+                msg = await message.answer_photo(
+                    photo, caption=text, reply_markup=kb, parse_mode="HTML"
+                )
+                _remember(key, msg)
+                return
+            except TelegramBadRequest as e:
+                last_err = e
+                log.warning("answer_photo (%s) не вышел: %s", key, e)
+    except Exception as e:
+        last_err = e
+        log.warning("картинка %s: %s", key, e)
+
+    # 3) крайний случай - текст
+    log.error("Картинка %s не отправилась, шлю текст. Причина: %s", key, last_err)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 # ---------------------------------------------------------------- клавиатуры
